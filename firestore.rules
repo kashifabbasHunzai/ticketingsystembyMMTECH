@@ -1,0 +1,62 @@
+rules_version = '2';
+service cloud.firestore { match /databases/{db}/documents {
+  function signed() { return request.auth != null; }
+  function role() { return exists(/databases/$(db)/documents/users/$(request.auth.uid)) ? get(/databases/$(db)/documents/users/$(request.auth.uid)).data.role : ''; }
+  function isAdmin() { return signed() && (request.auth.token.email == 'adsc.rwpl@gmail.com' || role() == 'admin'); }
+  function isDesk() { return signed() && role() == 'desk'; }
+  function isGate() { return signed() && role() == 'gate'; }
+  function d() { return request.resource.data; }
+  // Shape every new ticket must have (public online bookings and desk sales)
+  function validTicket() {
+    return d().keys().hasOnly(['name','phone','idType','idNo','jk','payName','source','trx','qty','type','group','no','amount','groupQty','total','status','hasShot','checkedIn','sent','by','byName','createdAt'])
+      && d().name is string && d().name.size() >= 1 && d().name.size() <= 80
+      && d().get('phone','').size() <= 20 && d().get('idNo','').size() <= 20 && d().get('jk','').size() <= 40
+      && d().get('payName','').size() <= 80 && d().get('trx','').size() <= 200
+      && d().qty == 1 && d().checkedIn == false && d().sent == false
+      && d().no is int && d().no >= 1 && d().no <= 100000
+      && d().groupQty is int && d().groupQty >= 1 && d().groupQty <= 5
+      && d().amount is number && d().amount >= 0 && d().amount <= 100000
+      && d().createdAt == request.time;
+  }
+  match /users/{uid} {
+    allow read: if signed() && (request.auth.uid == uid || isAdmin());
+    allow write: if isAdmin();
+  }
+  match /meta/event {
+    allow read: if true;
+    // Public counter bump is only allowed together with a real new ticket (the "last" ticket, whose number equals the new seq)
+    allow update: if d().diff(resource.data).affectedKeys().hasOnly(['held','seq','last'])
+      && d().seq is int && d().seq > resource.data.seq && d().seq <= resource.data.seq + 5
+      && d().held - resource.data.held == d().seq - resource.data.seq
+      && d().held <= resource.data.capacity
+      && resource.data.get('open', true) != false
+      && d().last is string
+      && existsAfter(/databases/$(db)/documents/bookings/$(d().last))
+      && getAfter(/databases/$(db)/documents/bookings/$(d().last)).data.no == d().seq;
+    allow write: if isAdmin();
+  }
+  match /bookings/{id} {
+    allow get: if true;
+    allow list: if isAdmin()
+      || (isDesk() && resource.data.get('by','') == request.auth.uid)
+      || (isGate() && request.query.limit <= 5)
+      || (isGate() && resource.data.get('checkedInBy','') == request.auth.uid);
+    allow create: if (isDesk() && validTicket() && d().status == 'confirmed' && d().source == 'desk' && d().by == request.auth.uid)
+      || isAdmin()
+      || (validTicket() && d().status == 'pending' && d().source == 'online' && !('by' in d()) && !('byName' in d()));
+    allow update: if isAdmin()
+      || (isGate() && resource.data.status == 'confirmed' && resource.data.checkedIn == false
+          && d().diff(resource.data).affectedKeys().hasOnly(['checkedIn','checkedInAt','checkedInBy','checkedInByName'])
+          && d().checkedIn == true && d().checkedInBy == request.auth.uid)
+      || (isDesk() && resource.data.get('by','') == request.auth.uid && resource.data.get('sent', false) != true
+          && d().diff(resource.data).affectedKeys().hasOnly(['name','phone','idType','idNo','jk','sent','editedAt'])
+          && d().name.size() <= 80 && d().get('phone','').size() <= 20 && d().get('idNo','').size() <= 20 && d().get('jk','').size() <= 40);
+    allow delete: if isAdmin();
+  }
+  match /shots/{id} {
+    allow create: if existsAfter(/databases/$(db)/documents/bookings/$(id))
+      && d().keys().hasOnly(['d']) && d().d is string && d().d.size() < 400000;
+    allow get: if isAdmin() || isDesk();
+    allow delete: if isAdmin();
+  }
+}}
